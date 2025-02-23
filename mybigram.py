@@ -1,6 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import torch.nn as nn
 
 words = open("names.txt", "r").read().splitlines()
 
@@ -51,7 +52,7 @@ for _ in range(5):
         if ix == 0:
             break
         word += itos[ix]
-    # print(word)
+    print(word)
 
 # Likelihood computation
 log_likelihood = 0.0
@@ -108,7 +109,7 @@ for i in range(num):
 # Optimization
 W = torch.randn((27, 27), requires_grad=True, generator=g)
 
-for _ in range(1000):
+for _ in range(200):
     ## forward pass
     logits = xenc @ W
     counts = logits.exp()  # This is a proxy for N above
@@ -130,6 +131,47 @@ for _ in range(5):
     while True:
         xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
         logits = xenc @ W
+        counts = logits.exp()
+        p = counts / counts.sum(dim=1, keepdim=True)
+        ix = torch.multinomial(p, 1, generator=g).item()
+        if ix == 0:
+            break
+        word += itos[ix]
+    print(word)
+
+
+## Write the model the pytorch way
+class BigramModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn((27, 27)))
+
+    def forward(self, x):
+        # Can be simplified even further by just returning self.W[x] since x is one-hot encoded
+        return x @ self.W
+
+# Training loop
+model = BigramModel()
+opt = torch.optim.SGD(model.parameters(), lr=50.0)
+xenc = F.one_hot(xs, num_classes=27).float()
+for _ in range(200):
+    logits = model(xenc)
+    counts = logits.exp()
+    probs = counts / counts.sum(dim=1, keepdim=True)
+    loss = -probs[torch.arange(num), ys].log().mean()
+    loss += (model.W**2).mean() * 0.01
+    print(f"{loss=}")
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+g = torch.Generator().manual_seed(0)
+for _ in range(5):
+    ix = 0
+    word = ''
+    while True:
+        xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
+        logits = model(xenc)
         counts = logits.exp()
         p = counts / counts.sum(dim=1, keepdim=True)
         ix = torch.multinomial(p, 1, generator=g).item()
