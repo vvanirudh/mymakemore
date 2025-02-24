@@ -39,11 +39,15 @@ g = torch.Generator().manual_seed(0)
 embed_size = 10
 context_embed_size = block_size * embed_size
 C = torch.randn((27, embed_size), generator=g)
-W1 = torch.randn((context_embed_size, 200), generator=g)
-b1 = torch.randn(200, generator=g)
-W2 = torch.randn((200, 27), generator=g)
-b2 = torch.randn(27, generator=g)
-parameters = [C, W1, b1, W2, b2]
+W1 = torch.randn((context_embed_size, 200), generator=g) * (5/3) / (context_embed_size**0.5)
+b1 = torch.randn(200, generator=g) * 0.01
+W2 = torch.randn((200, 27), generator=g) * 0.01
+b2 = torch.randn(27, generator=g) * 0.0
+bngain = torch.ones((1, 200))
+bnbias = torch.zeros((1, 200))
+bnmean_running = torch.zeros((1, 200))
+bnstd_running = torch.ones((1, 200))
+parameters = [C, W1, b1, W2, b2, bngain, bnbias]
 for p in parameters:
     p.requires_grad = True
 
@@ -52,7 +56,7 @@ for p in parameters:
 
 # lri = []
 lossi = []
-for i in range(100000):
+for i in range(200000):
     # minibatch construct
     ix = torch.randint(0, Xtr.shape[0], (32,))
     X_batch = Xtr[ix]
@@ -60,7 +64,15 @@ for i in range(100000):
     # forward pass
     # (N, 3, 2)
     emb = C[X_batch]
-    h = torch.tanh(emb.view(-1, context_embed_size) @ W1 + b1)
+    hpreact = emb.view(-1, context_embed_size) @ W1 # + b1 # bias is not needed as norm layer removes it
+    # apply batch normalization
+    bnmeani = hpreact.mean(0, keepdim=True)
+    bnstdi = hpreact.std(0, keepdim=True) + 1e-8
+    hpreact = bngain * (hpreact - bnmeani) / bnstdi + bnbias
+    with torch.no_grad():
+        bnmean_running = 0.999 * bnmean_running + 0.001 * bnmeani
+        bnstd_running = 0.999 * bnstd_running + 0.001 * bnstdi
+    h = torch.tanh(hpreact)
     logits = h @ W2 + b2
     loss = F.cross_entropy(logits, Y_batch)
     # print(f"{loss=}")
@@ -72,15 +84,20 @@ for i in range(100000):
 
     # lr = lrs[i]
     lr = 10**-1
-    if i > 20000:
+    if i > 100000:
         lr = 10**-2
-    elif i > 60000:
-        lr = 5 * 10**-3
     for p in parameters:
         p.data += -lr * p.grad
 
     # lri.append(lre[i])
     lossi.append(loss.log10().item())
+
+# plt.hist(hpreact.view(-1).tolist(), 50)
+# plt.show()
+
+# plt.figure(figsize=(20, 10))
+# plt.imshow(h.abs() > 0.99, cmap="gray", interpolation="nearest")
+# plt.show()
 
 # plt.plot(lri, lossi)
 # plt.show()
@@ -90,19 +107,36 @@ for i in range(100000):
 # plt.show()
 # plt.savefig('loss.png')
 
+# Calibrate batchnorm at end of training
+# with torch.no_grad():
+#     # pass the training set through
+#     emb = C[Xtr]
+#     embcat = emb.view(emb.shape[0], -1)
+#     hpreact = embcat @ W1 + b1
+#     bnmean = hpreact.mean(0, keepdim=True)
+#     bnstd = hpreact.std(0, keepdim=True)
+
 # Evaluate on train dataset
-emb = C[Xtr]
-h = torch.tanh(emb.view(-1, context_embed_size) @ W1 + b1)
-logits = h @ W2 + b2
-train_loss = F.cross_entropy(logits, Ytr)
-print(f"{train_loss=}")
+with torch.no_grad():
+    emb = C[Xtr]
+    hpreact = emb.view(-1, context_embed_size) @ W1 + b1
+    # apply batch normalization
+    hpreact = bngain * (hpreact - bnmean_running) / bnstd_running + bnbias
+    h = torch.tanh(hpreact)
+    logits = h @ W2 + b2
+    train_loss = F.cross_entropy(logits, Ytr)
+    print(f"{train_loss=}")
 
 # Evaluate on validation dataset
-emb = C[Xdev]
-h = torch.tanh(emb.view(-1, context_embed_size) @ W1 + b1)
-logits = h @ W2 + b2
-val_loss = F.cross_entropy(logits, Ydev)
-print(f"{val_loss=}")
+with torch.no_grad():
+    emb = C[Xdev]
+    hpreact = emb.view(-1, context_embed_size) @ W1 + b1
+    # apply batch normalization
+    hpreact = bngain * (hpreact - bnmean_running) / bnstd_running + bnbias
+    h = torch.tanh(hpreact)
+    logits = h @ W2 + b2
+    val_loss = F.cross_entropy(logits, Ydev)
+    print(f"{val_loss=}")
 
 # plt.figure(figsize=(8, 8))
 # plt.scatter(C[:, 0].data, C[:, 1].data, s=200)
@@ -118,7 +152,10 @@ for _ in range(20):
     context = [0] * block_size
     while True:
         emb = C[torch.tensor(context)]
-        h = torch.tanh(emb.view(-1, context_embed_size) @ W1 + b1)
+        hpreact = emb.view(-1, context_embed_size) @ W1 + b1
+        # apply batch normalization
+        hpreact = bngain * (hpreact - bnmean_running) / bnstd_running + bnbias
+        h = torch.tanh(hpreact)
         logits = h @ W2 + b2
         p = F.softmax(logits, dim=1)
         ix = torch.multinomial(p, 1, generator=g).item()
